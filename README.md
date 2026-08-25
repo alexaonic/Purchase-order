@@ -102,6 +102,43 @@ needs a one-time web-app deploy + Slack Interactivity setup:
 > Re-deploy note: after any later code change, use **Deploy ▸ Manage deployments ▸
 > edit ▸ New version** so the live URL runs the new code.
 
+## Update the tracker by @mentioning the PO Bot (optional)
+
+Instead of (or as well as) the buttons, you can update a PO by @mentioning a bot
+in the channel:
+
+> **@PO Bot PO-1023 passed**
+
+The bot understands these status words: **sample**, **passed**, **failed**,
+**paid** (50% deposit), **released** (final 50%). The rest of your message is
+matched against the **PO / File Name** column to find the right row, then it
+replies in-thread to confirm. If it's ambiguous, it asks you to be more specific.
+
+> Note: the bot is your own app (e.g. named "PO Bot") — not the literal `@claude`,
+> which is Anthropic's Slack app. Same experience, your own handle.
+
+**Setup (builds on the web-app + secret from the buttons section above):**
+
+1. **Add a bot user + scopes.** api.slack.com/apps → your `PO Alerts` app →
+   **OAuth & Permissions** → under **Bot Token Scopes** add `app_mentions:read`
+   and `chat:write`.
+2. **Install the app** to the workspace (same page → **Install to Workspace** /
+   **Reinstall**). Copy the **Bot User OAuth Token** (`xoxb-…`).
+3. **Store the token.** In `setUp()`, set `SLACK_BOT_TOKEN` to that `xoxb-…`
+   value, and run `setUp`.
+4. **Subscribe to mentions.** App → **Event Subscriptions** → toggle **On** →
+   **Request URL:** paste the same web-app URL with the secret
+   (`https://script.google.com/…/exec?secret=YOUR_SECRET`). Slack will verify it
+   (the script echoes the challenge automatically). Under **Subscribe to bot
+   events** add **`app_mention`** → **Save Changes**.
+5. **Invite the bot** to the channel: open the channel and type
+   `/invite @PO Bot`.
+6. Test it: `@PO Bot <part of a PO file name> passed`. The sheet updates and the
+   bot replies. ✅
+
+Both the buttons and the @mention use the **same** web-app URL — set it as the
+Request URL in *both* Interactivity and Event Subscriptions.
+
 ## Notes & limits
 - **Latency:** up to ~5 min, since the trigger is polled. Lower the interval in
   `createTriggers()` if you want faster.

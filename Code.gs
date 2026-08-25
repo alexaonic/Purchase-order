@@ -17,7 +17,8 @@ const PROP = {
   SLACK_WEBHOOK: 'SLACK_WEBHOOK_URL',     // Slack Incoming Webhook URL
   SLACK_MENTION: 'SLACK_MENTION_USER_ID', // Alex's Slack member ID, e.g. U01ABCDEF
   TRACKING_SHEET: 'TRACKING_SHEET_ID',    // PO QA Tracking spreadsheet
-  REQUEST_SECRET: 'SLACK_REQUEST_SECRET', // shared secret guarding the web app (button clicks)
+  REQUEST_SECRET: 'SLACK_REQUEST_SECRET', // shared secret guarding the web app (button clicks + @mentions)
+  BOT_TOKEN: 'SLACK_BOT_TOKEN',           // xoxb-… bot token, used to reply to @mentions
   SEEN_IDS: 'SEEN_FILE_IDS',              // internal: JSON array of processed file IDs
 };
 
@@ -32,6 +33,7 @@ function setUp() {
     [PROP.SLACK_MENTION]:  'PASTE_ALEX_SLACK_MEMBER_ID_HERE',      // e.g. U01ABCDEF
     [PROP.TRACKING_SHEET]: '1hqkIdUmQTNni0ezL6AoC8I4Fa3imWgW5s2En_cDoeOg', // PO QA Tracking
     [PROP.REQUEST_SECRET]: 'CHOOSE_A_RANDOM_STRING',   // any long random string; reuse it in the Slack Request URL
+    [PROP.BOT_TOKEN]:      'xoxb-PASTE_BOT_TOKEN_HERE', // only needed for the @mention PO Bot
   }, false);
   Logger.log('Script Properties saved. Now run createTriggers().');
 }
@@ -215,40 +217,168 @@ function doPost(e) {
       return ContentService.createTextOutput('unauthorized');
     }
 
-    const payload = JSON.parse(e.parameter.payload);
-    const action = payload.actions && payload.actions[0];
-    if (!action) return ContentService.createTextOutput('');
-
-    const fileId = action.value;
-    const clicker = payload.user ? payload.user.id : 'someone';
-
-    let col, val, label;
-    switch (action.action_id) {
-      case 'sample_received': col = 6; val = 'Yes';    label = 'Sample received'; break;
-      case 'qa_passed':       col = 7; val = 'Passed';  label = 'QA passed';       break;
-      case 'qa_failed':       col = 7; val = 'Failed';  label = 'QA failed';       break;
-      default: return ContentService.createTextOutput('');
+    // Slack Events API (@mentions, url_verification) arrive as a JSON body.
+    if (e.postData && e.postData.type === 'application/json') {
+      return handleSlackEvent(props, JSON.parse(e.postData.contents));
     }
 
-    const ok = updateRowByFileId(props, fileId, col, val, '<@' + clicker + '>', label);
-
-    // Confirm back in the channel thread via Slack's response_url.
-    if (payload.response_url) {
-      const msg = ok
-        ? ':white_check_mark: *' + label + '* by <@' + clicker + '> — tracker updated.'
-        : ':warning: Could not find this PO in the tracker (was the row deleted?).';
-      UrlFetchApp.fetch(payload.response_url, {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify({ response_type: 'in_channel', replace_original: false, text: msg }),
-        muteHttpExceptions: true,
-      });
+    // Slack interactive buttons arrive form-encoded with a `payload` param.
+    if (e.parameter && e.parameter.payload) {
+      return handleButton(props, JSON.parse(e.parameter.payload));
     }
-    return ContentService.createTextOutput(''); // 200 ack
+
+    return ContentService.createTextOutput('');
   } catch (err) {
     Logger.log('doPost error: ' + err);
     return ContentService.createTextOutput('error');
   }
+}
+
+// ── Button clicks (Sample Received / QA Passed / QA Failed) ──────────────────
+function handleButton(props, payload) {
+  const action = payload.actions && payload.actions[0];
+  if (!action) return ContentService.createTextOutput('');
+
+  const fileId = action.value;
+  const clicker = payload.user ? payload.user.id : 'someone';
+
+  const map = {
+    sample_received: { col: 6, val: 'Yes',    label: 'Sample received' },
+    qa_passed:       { col: 7, val: 'Passed', label: 'QA passed' },
+    qa_failed:       { col: 7, val: 'Failed', label: 'QA failed' },
+  };
+  const m = map[action.action_id];
+  if (!m) return ContentService.createTextOutput('');
+
+  const ok = updateRowByFileId(props, fileId, m.col, m.val, '<@' + clicker + '>', m.label);
+  if (payload.response_url) {
+    const msg = ok
+      ? ':white_check_mark: *' + m.label + '* by <@' + clicker + '> — tracker updated.'
+      : ':warning: Could not find this PO in the tracker (was the row deleted?).';
+    UrlFetchApp.fetch(payload.response_url, {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify({ response_type: 'in_channel', replace_original: false, text: msg }),
+      muteHttpExceptions: true,
+    });
+  }
+  return ContentService.createTextOutput(''); // 200 ack
+}
+
+// ── @mention events (the PO Bot) ─────────────────────────────────────────────
+function handleSlackEvent(props, body) {
+  // Slack verifies a new Events Request URL by asking us to echo a challenge.
+  if (body.type === 'url_verification') {
+    return ContentService.createTextOutput(body.challenge);
+  }
+  // De-dupe Slack's 3-second retries so we don't double-apply an update.
+  if (body.event_id) {
+    const cache = CacheService.getScriptCache();
+    if (cache.get(body.event_id)) return ContentService.createTextOutput('');
+    cache.put(body.event_id, '1', 300);
+  }
+  if (body.type === 'event_callback' && body.event &&
+      body.event.type === 'app_mention' && !body.event.bot_id) {
+    processMention(props, body.event);
+  }
+  return ContentService.createTextOutput(''); // 200 ack
+}
+
+/**
+ * Parses a message like "@PO Bot PO-1023 passed" and updates the matching row.
+ * Status keywords: sample / passed / failed / paid (deposit) / released (final).
+ * The PO is matched by any remaining word(s) against the "PO / File Name" column.
+ */
+function processMention(props, ev) {
+  const raw = (ev.text || '').replace(/<@[^>]+>/g, ' '); // strip mentions
+  const lower = raw.toLowerCase();
+
+  let col, val, label, statusWords;
+  if (/\bsample\b/.test(lower)) {
+    col = 6; val = 'Yes'; label = 'Sample received';
+    statusWords = ['sample', 'received', 'sampled'];
+  } else if (/\b(pass|passed|passes)\b/.test(lower)) {
+    col = 7; val = 'Passed'; label = 'QA passed';
+    statusWords = ['pass', 'passed', 'passes', 'qa'];
+  } else if (/\b(fail|failed|fails)\b/.test(lower)) {
+    col = 7; val = 'Failed'; label = 'QA failed';
+    statusWords = ['fail', 'failed', 'fails', 'qa'];
+  } else if (/\b(deposit|upfront|up-front|prepaid|paid)\b/.test(lower)) {
+    col = 8; val = 'Yes'; label = '50% paid up front';
+    statusWords = ['deposit', 'upfront', 'up-front', 'prepaid', 'paid', '50%'];
+  } else if (/\b(released|release|final|remaining|balance)\b/.test(lower)) {
+    col = 9; val = 'Yes'; label = 'Final 50% released';
+    statusWords = ['released', 'release', 'final', 'remaining', 'balance', '50%'];
+  } else {
+    slackReply(props, ev,
+      "I couldn't tell what to set. Try `PO-1023 passed` — I understand: " +
+      "*sample*, *passed*, *failed*, *paid*, *released*.");
+    return;
+  }
+
+  // What's left after removing status + filler words is the PO reference.
+  const filler = statusWords.concat(
+    ['mark', 'set', 'update', 'the', 'as', 'to', 'po', 'please', 'status', 'of', 'for', 'is', 'a', 'and']);
+  const terms = lower
+    .replace(/[^\w\s-]/g, ' ')
+    .split(/\s+/)
+    .filter(t => t.length >= 3 && filler.indexOf(t) === -1);
+
+  const matches = findPORows(props, terms);
+  if (matches.length === 0) {
+    slackReply(props, ev, "I couldn't find a PO matching *" + terms.join(' ') +
+      "* in the tracker. Check the file name and try again.");
+    return;
+  }
+  if (matches.length > 1) {
+    const names = matches.slice(0, 8).map(m => '• ' + m.name).join('\n');
+    slackReply(props, ev, "That matches several POs — be more specific:\n" + names);
+    return;
+  }
+
+  const row = matches[0];
+  applyUpdate(props, row.rowIndex, col, val, '<@' + ev.user + '>', label);
+  slackReply(props, ev, ':white_check_mark: *' + label + '* for *' + row.name +
+    '* — tracker updated.');
+}
+
+/** Returns [{rowIndex, name}] whose File Name contains ALL provided terms (case-insensitive). */
+function findPORows(props, terms) {
+  const sheetId = props.getProperty(PROP.TRACKING_SHEET);
+  if (!sheetId || terms.length === 0) return [];
+  const sheet = SpreadsheetApp.openById(sheetId).getSheets()[0];
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  const names = sheet.getRange(2, 2, lastRow - 1, 1).getValues(); // column B
+  const out = [];
+  for (let i = 0; i < names.length; i++) {
+    const name = String(names[i][0] || '');
+    const hay = name.toLowerCase();
+    if (terms.every(t => hay.indexOf(t) !== -1)) out.push({ rowIndex: i + 2, name: name });
+  }
+  return out;
+}
+
+/** Sets one cell on a known row and stamps the Notes column with who/when. */
+function applyUpdate(props, rowIndex, col, val, who, label) {
+  const sheet = SpreadsheetApp.openById(props.getProperty(PROP.TRACKING_SHEET)).getSheets()[0];
+  sheet.getRange(rowIndex, col).setValue(val);
+  const notes = sheet.getRange(rowIndex, 10); // column J
+  const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+  const prev = notes.getValue();
+  notes.setValue((prev ? prev + ' | ' : '') + label + ' by ' + who + ' ' + stamp);
+}
+
+/** Posts a threaded reply as the bot. Requires SLACK_BOT_TOKEN. */
+function slackReply(props, ev, text) {
+  const token = props.getProperty(PROP.BOT_TOKEN);
+  if (!token || token.indexOf('xoxb-') !== 0) { Logger.log('No bot token set'); return; }
+  UrlFetchApp.fetch('https://slack.com/api/chat.postMessage', {
+    method: 'post',
+    headers: { Authorization: 'Bearer ' + token },
+    contentType: 'application/json',
+    payload: JSON.stringify({ channel: ev.channel, thread_ts: ev.ts, text: text }),
+    muteHttpExceptions: true,
+  });
 }
 
 /** Finds the tracker row by File ID (column K) and sets one cell, stamping the Notes column. */
