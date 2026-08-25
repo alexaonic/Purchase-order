@@ -37,7 +37,7 @@ function setUp() {
     [PROP.REQUEST_SECRET]: 'CHOOSE_A_RANDOM_STRING',   // any long random string; reuse it in the Slack Request URL
     [PROP.BOT_TOKEN]:      'xoxb-PASTE_BOT_TOKEN_HERE', // only needed for the @mention PO Bot
     [PROP.ANTHROPIC_KEY]:  'sk-ant-PASTE_ANTHROPIC_API_KEY_HERE', // enables natural-language parsing
-    [PROP.MODEL]:          'claude-opus-5',             // or 'claude-haiku-4-5' for lower cost/latency
+    [PROP.MODEL]:          'claude-haiku-4-5',          // low cost/latency; use 'claude-opus-5' for max quality
   }, false);
   Logger.log('Script Properties saved. Now run createTriggers().');
 }
