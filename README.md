@@ -79,6 +79,29 @@ Done. Drop a file in the folder and within 5 minutes you'll get a ping.
 
 ---
 
+## Slack buttons that update the tracker (optional)
+
+Each PO ping carries **Sample Received / QA Passed / QA Failed** buttons. Clicking
+one writes straight back to that PO's row (and stamps who clicked, in Notes). This
+needs a one-time web-app deploy + Slack Interactivity setup:
+
+1. **Pick a secret.** In `setUp()`, set `SLACK_REQUEST_SECRET` to any long random
+   string (e.g. from a password generator). Run `setUp` again to save it.
+2. **Deploy the script as a Web App.** In the Apps Script editor:
+   **Deploy ▸ New deployment ▸ Type: Web app**. Set **Execute as: Me** and
+   **Who has access: Anyone**. Click **Deploy**, authorize, and copy the
+   **Web app URL** (ends in `/exec`).
+3. **Build the Request URL** by appending your secret:
+   `https://script.google.com/…/exec?secret=YOUR_SECRET`
+4. **Turn on Interactivity in Slack.** api.slack.com/apps → your `PO Alerts` app
+   → **Interactivity & Shortcuts** → toggle **On** → paste the Request URL from
+   step 3 into **Request URL** → **Save Changes**.
+5. Done. Click a button on a PO ping — the sheet updates and a confirmation posts
+   in the channel.
+
+> Re-deploy note: after any later code change, use **Deploy ▸ Manage deployments ▸
+> edit ▸ New version** so the live URL runs the new code.
+
 ## Notes & limits
 - **Latency:** up to ~5 min, since the trigger is polled. Lower the interval in
   `createTriggers()` if you want faster.

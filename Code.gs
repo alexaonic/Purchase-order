@@ -17,6 +17,7 @@ const PROP = {
   SLACK_WEBHOOK: 'SLACK_WEBHOOK_URL',     // Slack Incoming Webhook URL
   SLACK_MENTION: 'SLACK_MENTION_USER_ID', // Alex's Slack member ID, e.g. U01ABCDEF
   TRACKING_SHEET: 'TRACKING_SHEET_ID',    // PO QA Tracking spreadsheet
+  REQUEST_SECRET: 'SLACK_REQUEST_SECRET', // shared secret guarding the web app (button clicks)
   SEEN_IDS: 'SEEN_FILE_IDS',              // internal: JSON array of processed file IDs
 };
 
@@ -30,6 +31,7 @@ function setUp() {
     [PROP.SLACK_WEBHOOK]:  'PASTE_SLACK_WEBHOOK_URL_HERE',
     [PROP.SLACK_MENTION]:  'PASTE_ALEX_SLACK_MEMBER_ID_HERE',      // e.g. U01ABCDEF
     [PROP.TRACKING_SHEET]: '1hqkIdUmQTNni0ezL6AoC8I4Fa3imWgW5s2En_cDoeOg', // PO QA Tracking
+    [PROP.REQUEST_SECRET]: 'CHOOSE_A_RANDOM_STRING',   // any long random string; reuse it in the Slack Request URL
   }, false);
   Logger.log('Script Properties saved. Now run createTriggers().');
 }
@@ -114,6 +116,7 @@ function logToSheet(props, file) {
       'No',                                                  // 50% Paid Up Front?
       'No',                                                  // Final 50% Released?
       '',                                                    // Notes
+      file.getId(),                                          // File ID (used by Slack buttons)
     ]);
   } catch (e) {
     Logger.log('logToSheet failed: ' + e);
@@ -133,6 +136,7 @@ function notifySlack(props, file) {
     ? 'https://docs.google.com/spreadsheets/d/' + sheetId + '/edit'
     : null;
 
+  const fileId = file.getId();
   const actionButtons = [
     { type: 'button', text: { type: 'plain_text', text: 'Open PO' }, url: url },
   ];
@@ -143,6 +147,19 @@ function notifySlack(props, file) {
       url: trackerUrl,
     });
   }
+  // Interactive buttons — clicking these writes back to the tracker row.
+  // They only work once the web app + Slack Interactivity are set up (see README).
+  actionButtons.push(
+    { type: 'button', style: 'primary',
+      text: { type: 'plain_text', text: 'Sample Received' },
+      action_id: 'sample_received', value: fileId },
+    { type: 'button',
+      text: { type: 'plain_text', text: 'QA Passed' },
+      action_id: 'qa_passed', value: fileId },
+    { type: 'button', style: 'danger',
+      text: { type: 'plain_text', text: 'QA Failed' },
+      action_id: 'qa_failed', value: fileId }
+  );
 
   const payload = {
     text: 'New purchase order uploaded: ' + name, // fallback / notification text
@@ -180,6 +197,81 @@ function notifySlack(props, file) {
   if (res.getResponseCode() !== 200) {
     Logger.log('Slack error ' + res.getResponseCode() + ': ' + res.getContentText());
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slack interactivity — buttons write back to the tracker
+// Deployed as a Web App; Slack posts button clicks here (see README).
+// ─────────────────────────────────────────────────────────────────────────────
+function doPost(e) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+
+    // Basic shared-secret check: Slack's Request URL carries ?secret=… which
+    // must match the stored value. (Apps Script can't read request headers, so
+    // full signature verification isn't available — this guards the endpoint.)
+    const expected = props.getProperty(PROP.REQUEST_SECRET);
+    if (expected && (!e || !e.parameter || e.parameter.secret !== expected)) {
+      return ContentService.createTextOutput('unauthorized');
+    }
+
+    const payload = JSON.parse(e.parameter.payload);
+    const action = payload.actions && payload.actions[0];
+    if (!action) return ContentService.createTextOutput('');
+
+    const fileId = action.value;
+    const clicker = payload.user ? payload.user.id : 'someone';
+
+    let col, val, label;
+    switch (action.action_id) {
+      case 'sample_received': col = 6; val = 'Yes';    label = 'Sample received'; break;
+      case 'qa_passed':       col = 7; val = 'Passed';  label = 'QA passed';       break;
+      case 'qa_failed':       col = 7; val = 'Failed';  label = 'QA failed';       break;
+      default: return ContentService.createTextOutput('');
+    }
+
+    const ok = updateRowByFileId(props, fileId, col, val, '<@' + clicker + '>', label);
+
+    // Confirm back in the channel thread via Slack's response_url.
+    if (payload.response_url) {
+      const msg = ok
+        ? ':white_check_mark: *' + label + '* by <@' + clicker + '> — tracker updated.'
+        : ':warning: Could not find this PO in the tracker (was the row deleted?).';
+      UrlFetchApp.fetch(payload.response_url, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({ response_type: 'in_channel', replace_original: false, text: msg }),
+        muteHttpExceptions: true,
+      });
+    }
+    return ContentService.createTextOutput(''); // 200 ack
+  } catch (err) {
+    Logger.log('doPost error: ' + err);
+    return ContentService.createTextOutput('error');
+  }
+}
+
+/** Finds the tracker row by File ID (column K) and sets one cell, stamping the Notes column. */
+function updateRowByFileId(props, fileId, col, val, who, label) {
+  const sheetId = props.getProperty(PROP.TRACKING_SHEET);
+  if (!sheetId) return false;
+  const sheet = SpreadsheetApp.openById(sheetId).getSheets()[0];
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return false;
+
+  const ids = sheet.getRange(2, 11, lastRow - 1, 1).getValues(); // column K
+  for (let i = 0; i < ids.length; i++) {
+    if (ids[i][0] === fileId) {
+      const row = i + 2;
+      sheet.getRange(row, col).setValue(val);
+      const notes = sheet.getRange(row, 10); // column J
+      const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+      const prev = notes.getValue();
+      notes.setValue((prev ? prev + ' | ' : '') + label + ' by ' + who + ' ' + stamp);
+      return true;
+    }
+  }
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
