@@ -111,8 +111,10 @@ function notifySlack(props, file) {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: (mention ? mention + ' — ' : '') +
-                'please make sure we receive a *physical sample* before this PO is sent out.',
+          text: (mention ? mention + ' — ' : '') + 'QA gate before this PO is completed:\n' +
+                '• :package: Confirm we receive a *physical sample* before the PO is sent out.\n' +
+                '• :heavy_dollar_sign: *Hold back 50% of the invoice* — pay at most 50% up front and ' +
+                'release the final 50% *only after* the product/ingredient *passes QA*.',
         },
       },
       {

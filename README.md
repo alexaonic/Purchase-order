@@ -1,8 +1,16 @@
 # Purchase Order → Slack automation
 
 When a new purchase order lands in the Aonic PO Google Drive folder, this posts a
-Slack message tagging **Alex Dyckerhoff** with a reminder to secure a **physical
-sample before the PO is sent out**.
+Slack message tagging **Alex Dyckerhoff** with the PO **QA gate** reminder.
+
+## QA gate (the rule this enforces)
+Every PO must clear two checks before it's completed:
+1. **Physical sample** — we must receive a physical sample before the PO is sent out.
+2. **50% invoice holdback** — pay at most 50% up front; release the final 50%
+   **only after** the product/ingredient **passes QA**. If it fails, the holdback
+   is withheld until the issue is resolved or the order is rejected.
+
+The Slack ping restates both checks on every new PO.
 
 It runs entirely on **Google Apps Script** (Google's cloud) via a scheduled
 trigger — there is no server to run or maintain.
