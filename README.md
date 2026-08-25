@@ -139,6 +139,45 @@ replies in-thread to confirm. If it's ambiguous, it asks you to be more specific
 Both the buttons and the @mention use the **same** web-app URL — set it as the
 Request URL in *both* Interactivity and Event Subscriptions.
 
+### Natural-language understanding (Claude)
+
+By default the bot understands flexible, plain-English messages by sending them to
+Claude (the Anthropic API) along with the current PO list, e.g.:
+
+> **@PO Bot the vanilla protein order is good to go** → QA Passed
+> **@PO Bot we got the sample for the collagen batch** → Sample Received
+
+To enable it:
+
+1. Get an Anthropic API key at https://console.anthropic.com → **API Keys**
+   (`sk-ant-…`).
+2. In `setUp()`, set `ANTHROPIC_API_KEY` to that key. Optionally set `CLAUDE_MODEL`
+   — defaults to `claude-opus-5`; use `claude-haiku-4-5` for lower cost/latency.
+   Run `setUp` again.
+3. Test it without Slack: edit the phrase in `testMention()`, run it, and check
+   **Executions** for the interpreted result.
+
+If no key is set (or a call fails), the bot automatically falls back to simple
+keyword matching (*sample / passed / failed / paid / released* + part of the file
+name), so it keeps working either way. Cost is a fraction of a cent per message.
+
+## Redeploying after a code change
+
+The web app serves a **pinned version** of the code, so editing `Code.gs` does
+**not** change what Slack hits until you publish a new version:
+
+1. Paste the latest [`Code.gs`](Code.gs) over the editor contents and **Save**.
+2. **Deploy ▸ Manage deployments** → click the ✏️ **edit** (pencil) on your
+   existing web-app deployment.
+3. **Version** dropdown → **New version** → **Deploy**.
+   - Keeping the same deployment means the **URL stays the same** — no need to
+     re-paste anything into Slack.
+4. If you added/changed config, run **`setUp`** again. If prompted to
+   re-authorize (new permissions), approve it.
+
+> Do **not** use "New deployment" for updates — that creates a *new* URL and you'd
+> have to update Slack. Always edit the existing deployment → New version.
+
 ## Notes & limits
 - **Latency:** up to ~5 min, since the trigger is polled. Lower the interval in
   `createTriggers()` if you want faster.

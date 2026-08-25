@@ -19,6 +19,8 @@ const PROP = {
   TRACKING_SHEET: 'TRACKING_SHEET_ID',    // PO QA Tracking spreadsheet
   REQUEST_SECRET: 'SLACK_REQUEST_SECRET', // shared secret guarding the web app (button clicks + @mentions)
   BOT_TOKEN: 'SLACK_BOT_TOKEN',           // xoxb-… bot token, used to reply to @mentions
+  ANTHROPIC_KEY: 'ANTHROPIC_API_KEY',     // sk-ant-… key, enables natural-language parsing
+  MODEL: 'CLAUDE_MODEL',                  // optional; defaults to claude-opus-5
   SEEN_IDS: 'SEEN_FILE_IDS',              // internal: JSON array of processed file IDs
 };
 
@@ -34,6 +36,8 @@ function setUp() {
     [PROP.TRACKING_SHEET]: '1hqkIdUmQTNni0ezL6AoC8I4Fa3imWgW5s2En_cDoeOg', // PO QA Tracking
     [PROP.REQUEST_SECRET]: 'CHOOSE_A_RANDOM_STRING',   // any long random string; reuse it in the Slack Request URL
     [PROP.BOT_TOKEN]:      'xoxb-PASTE_BOT_TOKEN_HERE', // only needed for the @mention PO Bot
+    [PROP.ANTHROPIC_KEY]:  'sk-ant-PASTE_ANTHROPIC_API_KEY_HERE', // enables natural-language parsing
+    [PROP.MODEL]:          'claude-opus-5',             // or 'claude-haiku-4-5' for lower cost/latency
   }, false);
   Logger.log('Script Properties saved. Now run createTriggers().');
 }
@@ -283,79 +287,154 @@ function handleSlackEvent(props, body) {
   return ContentService.createTextOutput(''); // 200 ack
 }
 
+// The five statuses the bot can set, keyed by a canonical action name.
+const STATUS_MAP = {
+  sample:   { col: 6, val: 'Yes',    label: 'Sample received' },
+  passed:   { col: 7, val: 'Passed', label: 'QA passed' },
+  failed:   { col: 7, val: 'Failed', label: 'QA failed' },
+  paid:     { col: 8, val: 'Yes',    label: '50% paid up front' },
+  released: { col: 9, val: 'Yes',    label: 'Final 50% released' },
+};
+
 /**
- * Parses a message like "@PO Bot PO-1023 passed" and updates the matching row.
- * Status keywords: sample / passed / failed / paid (deposit) / released (final).
- * The PO is matched by any remaining word(s) against the "PO / File Name" column.
+ * Handles "@PO Bot <natural language>" → figures out the status + which PO, then
+ * updates the row. Uses Claude to interpret the message when an API key is set,
+ * and falls back to keyword matching otherwise.
  */
 function processMention(props, ev) {
-  const raw = (ev.text || '').replace(/<@[^>]+>/g, ' '); // strip mentions
-  const lower = raw.toLowerCase();
-
-  let col, val, label, statusWords;
-  if (/\bsample\b/.test(lower)) {
-    col = 6; val = 'Yes'; label = 'Sample received';
-    statusWords = ['sample', 'received', 'sampled'];
-  } else if (/\b(pass|passed|passes)\b/.test(lower)) {
-    col = 7; val = 'Passed'; label = 'QA passed';
-    statusWords = ['pass', 'passed', 'passes', 'qa'];
-  } else if (/\b(fail|failed|fails)\b/.test(lower)) {
-    col = 7; val = 'Failed'; label = 'QA failed';
-    statusWords = ['fail', 'failed', 'fails', 'qa'];
-  } else if (/\b(deposit|upfront|up-front|prepaid|paid)\b/.test(lower)) {
-    col = 8; val = 'Yes'; label = '50% paid up front';
-    statusWords = ['deposit', 'upfront', 'up-front', 'prepaid', 'paid', '50%'];
-  } else if (/\b(released|release|final|remaining|balance)\b/.test(lower)) {
-    col = 9; val = 'Yes'; label = 'Final 50% released';
-    statusWords = ['released', 'release', 'final', 'remaining', 'balance', '50%'];
-  } else {
-    slackReply(props, ev,
-      "I couldn't tell what to set. Try `PO-1023 passed` — I understand: " +
-      "*sample*, *passed*, *failed*, *paid*, *released*.");
+  const text = (ev.text || '').replace(/<@[^>]+>/g, ' ').trim(); // strip mentions
+  const rows = getAllPORows(props);
+  if (rows.length === 0) {
+    slackReply(props, ev, "The tracker has no POs logged yet, so there's nothing to update.");
     return;
   }
 
-  // What's left after removing status + filler words is the PO reference.
-  const filler = statusWords.concat(
-    ['mark', 'set', 'update', 'the', 'as', 'to', 'po', 'please', 'status', 'of', 'for', 'is', 'a', 'and']);
-  const terms = lower
-    .replace(/[^\w\s-]/g, ' ')
-    .split(/\s+/)
-    .filter(t => t.length >= 3 && filler.indexOf(t) === -1);
+  const result = interpretMessage(props, text, rows);
+  if (result.error) { slackReply(props, ev, result.error); return; }
 
-  const matches = findPORows(props, terms);
-  if (matches.length === 0) {
-    slackReply(props, ev, "I couldn't find a PO matching *" + terms.join(' ') +
-      "* in the tracker. Check the file name and try again.");
-    return;
-  }
-  if (matches.length > 1) {
-    const names = matches.slice(0, 8).map(m => '• ' + m.name).join('\n');
-    slackReply(props, ev, "That matches several POs — be more specific:\n" + names);
-    return;
-  }
-
-  const row = matches[0];
-  applyUpdate(props, row.rowIndex, col, val, '<@' + ev.user + '>', label);
-  slackReply(props, ev, ':white_check_mark: *' + label + '* for *' + row.name +
+  applyUpdate(props, result.row.rowIndex, result.col, result.val, '<@' + ev.user + '>', result.label);
+  slackReply(props, ev, ':white_check_mark: *' + result.label + '* for *' + result.row.name +
     '* — tracker updated.');
 }
 
-/** Returns [{rowIndex, name}] whose File Name contains ALL provided terms (case-insensitive). */
-function findPORows(props, terms) {
+/** Returns every PO row as [{rowIndex, name}]. */
+function getAllPORows(props) {
   const sheetId = props.getProperty(PROP.TRACKING_SHEET);
-  if (!sheetId || terms.length === 0) return [];
+  if (!sheetId) return [];
   const sheet = SpreadsheetApp.openById(sheetId).getSheets()[0];
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
   const names = sheet.getRange(2, 2, lastRow - 1, 1).getValues(); // column B
-  const out = [];
-  for (let i = 0; i < names.length; i++) {
-    const name = String(names[i][0] || '');
-    const hay = name.toLowerCase();
-    if (terms.every(t => hay.indexOf(t) !== -1)) out.push({ rowIndex: i + 2, name: name });
+  return names.map((r, i) => ({ rowIndex: i + 2, name: String(r[0] || '') }))
+              .filter(r => r.name);
+}
+
+/**
+ * Returns {col, val, label, row} for a valid update, or {error} with a message.
+ * Tries Claude first (if configured), then keyword matching.
+ */
+function interpretMessage(props, text, rows) {
+  const ai = classifyWithClaude(props, text, rows);
+  if (ai && STATUS_MAP[ai.action]) {
+    const match = matchPO(rows, ai.po);
+    if (match) return Object.assign({ row: match }, STATUS_MAP[ai.action]);
+    return { error: 'I understood *' + STATUS_MAP[ai.action].label +
+      "* but couldn't tell which PO you meant. Mention part of the file name." };
   }
-  return out;
+  if (ai && ai.action === 'none') {
+    return { error: "I couldn't tell what you wanted. Try e.g. `the vanilla protein order passed QA`." };
+  }
+  return keywordInterpret(text, rows); // API not configured or call failed
+}
+
+/** Calls the Anthropic Messages API to interpret the message. Returns {action, po} or null. */
+function classifyWithClaude(props, text, rows) {
+  const key = props.getProperty(PROP.ANTHROPIC_KEY);
+  if (!key || key.indexOf('sk-ant-') !== 0) return null; // not configured → use fallback
+
+  const system =
+    'You turn a Slack message into a purchase-order (PO) tracker update. ' +
+    'Reply with ONLY compact JSON, no prose, no code fences. ' +
+    'Schema: {"action":"sample|passed|failed|paid|released|none","po":"<exact file name from the candidate list, or empty>"}. ' +
+    'Meanings — sample: a physical sample was received; passed: it passed QA; failed: it failed QA; ' +
+    'paid: the 50% deposit was paid up front; released: the final 50% was released/paid. ' +
+    'Pick the single candidate PO the user is referring to and copy its name EXACTLY. ' +
+    'If no status is clear or no PO matches, use "none" and/or an empty po.';
+  const user = 'Candidate POs:\n' + rows.map(r => '- ' + r.name).join('\n') +
+    '\n\nSlack message: ' + text;
+
+  const payload = {
+    model: props.getProperty(PROP.MODEL) || 'claude-opus-5',
+    max_tokens: 200,
+    output_config: { effort: 'low' },
+    system: system,
+    messages: [{ role: 'user', content: user }],
+  };
+
+  try {
+    const res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) {
+      Logger.log('Claude API ' + res.getResponseCode() + ': ' + res.getContentText());
+      return null;
+    }
+    const data = JSON.parse(res.getContentText());
+    const out = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    const jsonStr = out.replace(/```json/gi, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(jsonStr);
+    return { action: String(parsed.action || 'none'), po: String(parsed.po || '') };
+  } catch (e) {
+    Logger.log('classifyWithClaude failed: ' + e);
+    return null;
+  }
+}
+
+/** Finds a row matching a PO name (exact, then substring either direction). */
+function matchPO(rows, poName) {
+  if (!poName) return null;
+  const q = poName.toLowerCase();
+  return rows.find(r => r.name.toLowerCase() === q) ||
+         rows.find(r => r.name.toLowerCase().indexOf(q) !== -1) ||
+         rows.find(r => q.indexOf(r.name.toLowerCase()) !== -1) || null;
+}
+
+/** Fallback: status keyword + file-name term matching, no AI. */
+function keywordInterpret(text, rows) {
+  const lower = text.toLowerCase();
+
+  let action, statusWords;
+  if (/\bsample\b/.test(lower)) { action = 'sample'; statusWords = ['sample', 'received', 'sampled']; }
+  else if (/\b(pass|passed|passes)\b/.test(lower)) { action = 'passed'; statusWords = ['pass', 'passed', 'passes', 'qa']; }
+  else if (/\b(fail|failed|fails)\b/.test(lower)) { action = 'failed'; statusWords = ['fail', 'failed', 'fails', 'qa']; }
+  else if (/\b(deposit|upfront|up-front|prepaid|paid)\b/.test(lower)) { action = 'paid'; statusWords = ['deposit', 'upfront', 'up-front', 'prepaid', 'paid', '50%']; }
+  else if (/\b(released|release|final|remaining|balance)\b/.test(lower)) { action = 'released'; statusWords = ['released', 'release', 'final', 'remaining', 'balance', '50%']; }
+  else {
+    return { error: "I couldn't tell what to set. Try `PO-1023 passed` — I understand: " +
+      '*sample*, *passed*, *failed*, *paid*, *released*.' };
+  }
+
+  const filler = statusWords.concat(
+    ['mark', 'set', 'update', 'the', 'as', 'to', 'po', 'please', 'status', 'of', 'for', 'is', 'a', 'and']);
+  const terms = lower.replace(/[^\w\s-]/g, ' ').split(/\s+/)
+    .filter(t => t.length >= 3 && filler.indexOf(t) === -1);
+
+  const matches = rows.filter(r => {
+    const hay = r.name.toLowerCase();
+    return terms.length > 0 && terms.every(t => hay.indexOf(t) !== -1);
+  });
+  if (matches.length === 0) {
+    return { error: "I couldn't find a PO matching *" + terms.join(' ') + '* in the tracker.' };
+  }
+  if (matches.length > 1) {
+    return { error: 'That matches several POs — be more specific:\n' +
+      matches.slice(0, 8).map(m => '• ' + m.name).join('\n') };
+  }
+  return Object.assign({ row: matches[0] }, STATUS_MAP[action]);
 }
 
 /** Sets one cell on a known row and stamps the Notes column with who/when. */
@@ -402,6 +481,19 @@ function updateRowByFileId(props, fileId, col, val, who, label) {
     }
   }
   return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test the message interpreter without Slack. Edit the phrase and run testMention;
+// the result (or error) is written to the execution log.
+// ─────────────────────────────────────────────────────────────────────────────
+function testMention() {
+  const phrase = 'the vanilla protein order passed QA'; // ← edit this to try phrasings
+  const props = PropertiesService.getScriptProperties();
+  const rows = getAllPORows(props);
+  Logger.log('POs in tracker: ' + JSON.stringify(rows.map(r => r.name)));
+  const result = interpretMessage(props, phrase, rows);
+  Logger.log('Interpreted "' + phrase + '" → ' + JSON.stringify(result));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
