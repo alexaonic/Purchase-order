@@ -1,0 +1,5 @@
+# clasp (Apps Script CLI) local credentials — never commit
+.clasp.json
+.clasprc.json
+node_modules/
+*.log
