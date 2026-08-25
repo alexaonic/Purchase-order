@@ -16,6 +16,7 @@ const PROP = {
   FOLDER_ID: 'PO_FOLDER_ID',              // Drive folder to watch
   SLACK_WEBHOOK: 'SLACK_WEBHOOK_URL',     // Slack Incoming Webhook URL
   SLACK_MENTION: 'SLACK_MENTION_USER_ID', // Alex's Slack member ID, e.g. U01ABCDEF
+  TRACKING_SHEET: 'TRACKING_SHEET_ID',    // PO QA Tracking spreadsheet
   SEEN_IDS: 'SEEN_FILE_IDS',              // internal: JSON array of processed file IDs
 };
 
@@ -25,9 +26,10 @@ const PROP = {
  */
 function setUp() {
   PropertiesService.getScriptProperties().setProperties({
-    [PROP.FOLDER_ID]:     '1AE3MOYzictk13yx6Wjm4lbvb63fbCpq7',   // your PO folder
-    [PROP.SLACK_WEBHOOK]: 'PASTE_SLACK_WEBHOOK_URL_HERE',
-    [PROP.SLACK_MENTION]: 'PASTE_ALEX_SLACK_MEMBER_ID_HERE',      // e.g. U01ABCDEF
+    [PROP.FOLDER_ID]:      '1AE3MOYzictk13yx6Wjm4lbvb63fbCpq7',   // your PO folder
+    [PROP.SLACK_WEBHOOK]:  'PASTE_SLACK_WEBHOOK_URL_HERE',
+    [PROP.SLACK_MENTION]:  'PASTE_ALEX_SLACK_MEMBER_ID_HERE',      // e.g. U01ABCDEF
+    [PROP.TRACKING_SHEET]: '1hqkIdUmQTNni0ezL6AoC8I4Fa3imWgW5s2En_cDoeOg', // PO QA Tracking
   }, false);
   Logger.log('Script Properties saved. Now run createTriggers().');
 }
@@ -77,7 +79,10 @@ function watchPOFolder() {
 
   newFiles
     .sort((a, b) => a.getDateCreated() - b.getDateCreated())
-    .forEach(file => notifySlack(props, file));
+    .forEach(file => {
+      logToSheet(props, file);
+      notifySlack(props, file);
+    });
 
   saveSeen(props, allIds);
   Logger.log('watchPOFolder: ' + newFiles.length + ' new file(s) pinged.');
@@ -88,6 +93,33 @@ function saveSeen(props, ids) {
   props.setProperty(PROP.SEEN_IDS, JSON.stringify(ids.slice(-1000)));
 }
 
+/**
+ * Appends a tracking row for a new PO. Columns:
+ * Date Added | PO / File Name | File Link | Supplier | Invoice Amount |
+ * Sample Received? | QA Status | 50% Paid Up Front? | Final 50% Released? | Notes
+ */
+function logToSheet(props, file) {
+  const sheetId = props.getProperty(PROP.TRACKING_SHEET);
+  if (!sheetId) return; // tracking optional — skip silently if not configured
+  try {
+    const sheet = SpreadsheetApp.openById(sheetId).getSheets()[0];
+    sheet.appendRow([
+      new Date(),                                            // Date Added
+      file.getName(),                                        // PO / File Name
+      '=HYPERLINK("' + file.getUrl() + '","Open")',          // File Link
+      '',                                                    // Supplier
+      '',                                                    // Invoice Amount
+      'No',                                                  // Sample Received?
+      'Pending',                                             // QA Status
+      'No',                                                  // 50% Paid Up Front?
+      'No',                                                  // Final 50% Released?
+      '',                                                    // Notes
+    ]);
+  } catch (e) {
+    Logger.log('logToSheet failed: ' + e);
+  }
+}
+
 function notifySlack(props, file) {
   const webhook = props.getProperty(PROP.SLACK_WEBHOOK);
   const mentionId = props.getProperty(PROP.SLACK_MENTION);
@@ -96,6 +128,21 @@ function notifySlack(props, file) {
   const mention = mentionId ? '<@' + mentionId + '>' : '';
   const url = file.getUrl();
   const name = file.getName();
+  const sheetId = props.getProperty(PROP.TRACKING_SHEET);
+  const trackerUrl = sheetId
+    ? 'https://docs.google.com/spreadsheets/d/' + sheetId + '/edit'
+    : null;
+
+  const actionButtons = [
+    { type: 'button', text: { type: 'plain_text', text: 'Open PO' }, url: url },
+  ];
+  if (trackerUrl) {
+    actionButtons.push({
+      type: 'button',
+      text: { type: 'plain_text', text: 'QA Tracker' },
+      url: trackerUrl,
+    });
+  }
 
   const payload = {
     text: 'New purchase order uploaded: ' + name, // fallback / notification text
@@ -119,9 +166,7 @@ function notifySlack(props, file) {
       },
       {
         type: 'actions',
-        elements: [
-          { type: 'button', text: { type: 'plain_text', text: 'Open PO' }, url: url },
-        ],
+        elements: actionButtons,
       },
     ],
   };

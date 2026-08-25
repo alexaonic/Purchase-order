@@ -23,10 +23,22 @@ trigger — there is no server to run or maintain.
 
 | Function | Schedule | Effect |
 |----------|----------|--------|
-| `watchPOFolder` | every 5 min | New file in the folder → Slack ping tagging Alex with the physical-sample reminder + an "Open PO" button |
+| `watchPOFolder` | every 5 min | New file in the folder → logs a row in the **PO QA Tracking** sheet **and** posts a Slack ping tagging Alex with the QA-gate reminder + "Open PO" / "QA Tracker" buttons |
 
 No duplicate pings: processed file IDs are remembered. The first run baselines
 whatever is already in the folder, so you won't get spammed with the backlog.
+
+### PO QA Tracking sheet
+Lives in the PO Drive folder. Every new PO auto-adds a row; the team fills in the
+status columns as the PO moves through QA:
+
+`Date Added | PO / File Name | File Link | Supplier | Invoice Amount | Sample Received? | QA Status | 50% Paid Up Front? | Final 50% Released? | Notes`
+
+- **Sample Received?** / **50% Paid Up Front?** / **Final 50% Released?** — Yes / No dropdowns
+- **QA Status** — Pending / Passed / Failed dropdown
+- Release the final 50% only once **QA Status = Passed**.
+
+Sheet: https://docs.google.com/spreadsheets/d/1hqkIdUmQTNni0ezL6AoC8I4Fa3imWgW5s2En_cDoeOg/edit
 
 ---
 
